@@ -1,40 +1,36 @@
 #!/usr/bin/env python3
 
 import csv
+import os
+import argparse
 from pathlib import Path
 from collections import defaultdict
+from datetime import datetime
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
-from datetime import datetime
 
 # ============================================
-# CONFIG
+# CONSTANTS
 # ============================================
-
-DNS_FOLDER = Path("/Users/brian/gitfiles/msinfra-staticdns")
-
-VIP_WORKBOOK = Path(
-    "/Users/brian/Library/CloudStorage/OneDrive-UniversityofCentralFlorida/F5 Load Balancer Project_GRP - Documents/f5_VIPs.xlsx"
-)
-
-timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-
-OUTPUT_WORKBOOK = Path(
-    f"/Users/brian/Downloads/f5_VIPs_with_dns_{timestamp}.xlsx"
-)
 
 SKIP_SHEET_NAMES = {"Appliances"}
 
-EXTERNAL_IP_COLUMN = 2
-INTERNAL_IP_COLUMN = 3
+EXTERNAL_IP_COLUMN = 2   # Column B
+INTERNAL_IP_COLUMN = 3   # Column C
 START_ROW = 2
 
-OUTPUT_INT_COUNT_COLUMN = 10
-OUTPUT_INT_DNS_COLUMN = 11
-OUTPUT_EXT_COUNT_COLUMN = 12
-OUTPUT_EXT_DNS_COLUMN = 13
+OUTPUT_INT_COUNT_COLUMN = 10  # J
+OUTPUT_INT_DNS_COLUMN   = 11  # K
+OUTPUT_EXT_COUNT_COLUMN = 12  # L
+OUTPUT_EXT_DNS_COLUMN   = 13  # M
 
 LEGACY_SHEET_NAME = "Legacy VIP Candidates"
+
+LIKELY_VIP_FILENAMES = [
+    "f5_VIPs.xlsx",
+    "F5_VIPs.xlsx",
+    "vip_inventory.xlsx",
+]
 
 # ============================================
 # HELPERS
@@ -99,7 +95,6 @@ def ptr_zone_to_ipv4(hostname, zone):
         return ""
 
     ip = ".".join(ip_parts)
-
     return ip if is_ipv4(ip) else ""
 
 def recreate_sheet(wb, sheet_name):
@@ -113,27 +108,90 @@ def autosize_columns(ws, min_width=12, max_width=80):
         for cell in col:
             if cell.value is not None:
                 max_len = max(max_len, len(str(cell.value)))
-        ws.column_dimensions[get_column_letter(col[0].column)].width = max(min_width, min(max_len + 2, max_width))
+        ws.column_dimensions[get_column_letter(col[0].column)].width = max(
+            min_width, min(max_len + 2, max_width)
+        )
 
-def print_source_diagnostics():
-    print("Source workbook:", VIP_WORKBOOK)
-    print("Output workbook:", OUTPUT_WORKBOOK)
+# ============================================
+# CONFIG / PATHS
+# ============================================
 
-    if not VIP_WORKBOOK.exists():
-        raise FileNotFoundError(f"Source workbook not found: {VIP_WORKBOOK}")
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Reconcile F5 VIP inventory with DNS exports."
+    )
+    parser.add_argument(
+        "--dns",
+        help="Directory containing DNS CSV exports. Overrides DNS_FOLDER env var."
+    )
+    parser.add_argument(
+        "--vip",
+        help="VIP workbook path. Overrides VIP_WORKBOOK env var."
+    )
+    parser.add_argument(
+        "--output",
+        help="Output directory. Overrides OUTPUT_FOLDER env var."
+    )
+    return parser.parse_args()
 
-    stat = VIP_WORKBOOK.stat()
+def find_vip_workbook_local():
+    print("Searching for VIP workbook in current directory...")
+
+    direct_candidates = [Path(name) for name in LIKELY_VIP_FILENAMES]
+
+    for candidate in direct_candidates:
+        if candidate.exists():
+            resolved = candidate.resolve()
+            print("Using VIP workbook:", resolved)
+            return resolved
+
+    raise FileNotFoundError(
+        "Could not locate VIP workbook automatically in the current directory. "
+        "Use --vip /path/to/workbook.xlsx or set VIP_WORKBOOK."
+    )
+
+def resolve_paths(args):
+    dns_env = os.getenv("DNS_FOLDER")
+    vip_env = os.getenv("VIP_WORKBOOK")
+    output_env = os.getenv("OUTPUT_FOLDER")
+
+    dns_folder = Path(args.dns) if args.dns else Path(dns_env) if dns_env else Path("./dns_exports")
+    output_folder = Path(args.output) if args.output else Path(output_env) if output_env else Path("./output")
+
+    if args.vip:
+        vip_workbook = Path(args.vip)
+    elif vip_env:
+        vip_workbook = Path(vip_env)
+    else:
+        vip_workbook = find_vip_workbook_local()
+
+    output_folder.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    output_workbook = output_folder / f"vip_dns_report_{timestamp}.xlsx"
+
+    return dns_folder, vip_workbook, output_workbook
+
+def print_source_diagnostics(vip_workbook, dns_folder, output_workbook):
+    print("DNS folder:", dns_folder)
+    print("Source workbook:", vip_workbook)
+    print("Output workbook:", output_workbook)
+
+    if not vip_workbook.exists():
+        raise FileNotFoundError(f"Source workbook not found: {vip_workbook}")
+
+    if not dns_folder.exists():
+        raise FileNotFoundError(f"DNS folder not found: {dns_folder}")
+
+    stat = vip_workbook.stat()
     modified = datetime.fromtimestamp(stat.st_mtime)
 
     print("Source exists: True")
     print("Source size bytes:", stat.st_size)
     print("Source modified:", modified)
 
-def print_sheet_preview(wb):
-    print("Loaded sheets:", ", ".join(wb.sheetnames))
-
 # ============================================
-# LOAD DNS CSV FILES
+# DNS LOADER
 # ============================================
 
 def load_dns_records(folder):
@@ -141,7 +199,11 @@ def load_dns_records(folder):
 
     csv_files = sorted(folder.glob("*.csv"))
     if not csv_files:
-        raise FileNotFoundError(f"No CSV files found in {folder}")
+        raise RuntimeError(f"No DNS CSV files found in {folder}")
+
+    print("DNS files detected:")
+    for csv_file in csv_files:
+        print("  ", csv_file.name)
 
     for csv_file in csv_files:
         print("Reading", csv_file.name)
@@ -169,16 +231,21 @@ def load_dns_records(folder):
                     if fqdn and is_ipv4(ip):
                         ip_to_dns[ip].add(fqdn)
 
+    if not ip_to_dns:
+        raise RuntimeError(
+            f"No DNS records loaded from {folder}. Check your DNS export files."
+        )
+
     return ip_to_dns
 
 # ============================================
-# UPDATE WORKBOOK
+# WORKBOOK PROCESSING
 # ============================================
 
-def update_workbook(ip_to_dns):
-    print("Opening workbook now...")
-    wb = load_workbook(VIP_WORKBOOK)
-    print_sheet_preview(wb)
+def update_workbook(vip_workbook, output_workbook, ip_to_dns):
+    print("Opening workbook...")
+    wb = load_workbook(vip_workbook)
+    print("Loaded sheets:", ", ".join(wb.sheetnames))
 
     legacy_rows = []
 
@@ -243,21 +310,27 @@ def update_workbook(ip_to_dns):
 
     autosize_columns(legacy_ws)
 
-    print("Saving workbook:", OUTPUT_WORKBOOK)
-    wb.save(OUTPUT_WORKBOOK)
-
+    print("Saving:", output_workbook)
+    wb.save(output_workbook)
     print("Legacy VIP candidates:", len(legacy_rows))
 
 # ============================================
 # MAIN
 # ============================================
 
-print_source_diagnostics()
+def main():
+    args = parse_args()
+    dns_folder, vip_workbook, output_workbook = resolve_paths(args)
 
-print("Loading DNS records...")
-ip_to_dns = load_dns_records(DNS_FOLDER)
-print("Unique IPs with DNS:", len(ip_to_dns))
+    print_source_diagnostics(vip_workbook, dns_folder, output_workbook)
 
-update_workbook(ip_to_dns)
+    print("Loading DNS records...")
+    ip_to_dns = load_dns_records(dns_folder)
+    print("Unique IPs found:", len(ip_to_dns))
 
-print("Done.")
+    update_workbook(vip_workbook, output_workbook, ip_to_dns)
+
+    print("Done.")
+
+if __name__ == "__main__":
+    main()
