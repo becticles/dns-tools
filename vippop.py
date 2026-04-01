@@ -13,7 +13,12 @@ from openpyxl.utils import get_column_letter
 # CONSTANTS
 # ============================================
 
-SKIP_SHEET_NAMES = {"Appliances"}
+SKIP_SHEET_NAMES = {
+    "Appliances",
+    "Legacy VIP Candidates",
+    "Legacy VIPs",
+    "Change Log",
+}
 
 EXTERNAL_IP_COLUMN = 2   # Column B
 INTERNAL_IP_COLUMN = 3   # Column C
@@ -111,6 +116,30 @@ def autosize_columns(ws, min_width=12, max_width=80):
         ws.column_dimensions[get_column_letter(col[0].column)].width = max(
             min_width, min(max_len + 2, max_width)
         )
+
+def write_if_changed(ws, row, col, new_value):
+    cell = ws.cell(row, col)
+    old_value = cell.value
+
+    old_norm = "" if old_value is None else str(old_value).strip()
+    new_norm = "" if new_value is None else str(new_value).strip()
+
+    # Suppress noisy terminal logging for blank -> 0 initialization on count columns,
+    # but still write the value so the workbook stays normalized.
+    if col in (OUTPUT_INT_COUNT_COLUMN, OUTPUT_EXT_COUNT_COLUMN):
+        if old_norm == "" and new_norm == "0":
+            cell.value = new_value
+            return False
+
+    if old_norm != new_norm:
+        print(
+            f"CHANGE | Sheet={ws.title} | Cell={cell.coordinate} | "
+            f"Old={repr(old_norm)} | New={repr(new_norm)}"
+        )
+        cell.value = new_value
+        return True
+
+    return False
 
 # ============================================
 # CONFIG / PATHS
@@ -248,6 +277,7 @@ def update_workbook(vip_workbook, output_workbook, ip_to_dns):
     print("Loaded sheets:", ", ".join(wb.sheetnames))
 
     legacy_rows = []
+    total_changes = 0
 
     for ws in wb.worksheets:
         if ws.title in SKIP_SHEET_NAMES:
@@ -255,11 +285,20 @@ def update_workbook(vip_workbook, output_workbook, ip_to_dns):
             continue
 
         print("Processing sheet:", ws.title)
+        sheet_changes = 0
 
-        ws.cell(1, OUTPUT_INT_COUNT_COLUMN, "Matched DNS Count")
-        ws.cell(1, OUTPUT_INT_DNS_COLUMN, "Matched DNS")
-        ws.cell(1, OUTPUT_EXT_COUNT_COLUMN, "External DNS Count")
-        ws.cell(1, OUTPUT_EXT_DNS_COLUMN, "External DNS")
+        if write_if_changed(ws, 1, OUTPUT_INT_COUNT_COLUMN, "Matched DNS Count"):
+            total_changes += 1
+            sheet_changes += 1
+        if write_if_changed(ws, 1, OUTPUT_INT_DNS_COLUMN, "Matched DNS"):
+            total_changes += 1
+            sheet_changes += 1
+        if write_if_changed(ws, 1, OUTPUT_EXT_COUNT_COLUMN, "External DNS Count"):
+            total_changes += 1
+            sheet_changes += 1
+        if write_if_changed(ws, 1, OUTPUT_EXT_DNS_COLUMN, "External DNS"):
+            total_changes += 1
+            sheet_changes += 1
 
         for row in range(START_ROW, ws.max_row + 1):
             if row % 500 == 0:
@@ -277,15 +316,28 @@ def update_workbook(vip_workbook, output_workbook, ip_to_dns):
             if is_ipv4(external_ip):
                 external_matches = sorted(ip_to_dns.get(external_ip, set()))
 
-            ws.cell(row, OUTPUT_INT_COUNT_COLUMN, len(internal_matches))
-            ws.cell(row, OUTPUT_INT_DNS_COLUMN, ", ".join(internal_matches))
-            ws.cell(row, OUTPUT_EXT_COUNT_COLUMN, len(external_matches))
-            ws.cell(row, OUTPUT_EXT_DNS_COLUMN, ", ".join(external_matches))
+            int_count = len(internal_matches)
+            int_dns = ", ".join(internal_matches) if internal_matches else ""
+            ext_count = len(external_matches)
+            ext_dns = ", ".join(external_matches) if external_matches else ""
+
+            if write_if_changed(ws, row, OUTPUT_INT_COUNT_COLUMN, int_count):
+                total_changes += 1
+                sheet_changes += 1
+            if write_if_changed(ws, row, OUTPUT_INT_DNS_COLUMN, int_dns):
+                total_changes += 1
+                sheet_changes += 1
+            if write_if_changed(ws, row, OUTPUT_EXT_COUNT_COLUMN, ext_count):
+                total_changes += 1
+                sheet_changes += 1
+            if write_if_changed(ws, row, OUTPUT_EXT_DNS_COLUMN, ext_dns):
+                total_changes += 1
+                sheet_changes += 1
 
             if (
                 (is_ipv4(internal_ip) or is_ipv4(external_ip))
-                and len(internal_matches) == 0
-                and len(external_matches) == 0
+                and not internal_matches
+                and not external_matches
             ):
                 legacy_rows.append([
                     ws.title,
@@ -294,6 +346,8 @@ def update_workbook(vip_workbook, output_workbook, ip_to_dns):
                     external_ip,
                     internal_ip
                 ])
+
+        print(f"Sheet changes for {ws.title}: {sheet_changes}")
 
     legacy_ws = recreate_sheet(wb, LEGACY_SHEET_NAME)
 
@@ -310,9 +364,11 @@ def update_workbook(vip_workbook, output_workbook, ip_to_dns):
 
     autosize_columns(legacy_ws)
 
-    print("Saving:", output_workbook)
-    wb.save(output_workbook)
+    print("Total changed cells:", total_changes)
     print("Legacy VIP candidates:", len(legacy_rows))
+    print("Saving:", output_workbook)
+
+    wb.save(output_workbook)
 
 # ============================================
 # MAIN
